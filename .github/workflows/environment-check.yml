@@ -1,0 +1,78 @@
+name: W100 build environment check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/environment-check.yml
+
+permissions: {}
+
+jobs:
+  diagnose:
+    name: Inspect free Linux runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Memory, CPU, disk and build tools
+        run: |
+          set -euo pipefail
+          {
+            printf 'Date (UTC): '
+            date -u
+            printf '\n--- Operating system ---\n'
+            cat /etc/os-release
+            uname -m
+            printf '\n--- Memory: free -h ---\n'
+            free -h
+            printf '\n--- Swap ---\n'
+            swapon --show
+            printf '\n--- CPU ---\n'
+            nproc
+            lscpu
+            printf '\n--- Disk: df -hT ---\n'
+            df -hT
+            printf '\n--- Block devices ---\n'
+            lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+            printf '\n--- Workspace free space (bytes) ---\n'
+            df -B1 --output=size,used,avail,target "$GITHUB_WORKSPACE"
+            printf '\n--- Build tool availability ---\n'
+            for tool in git make gcc g++ java python python2 python3 docker; do
+              if command -v "$tool" >/dev/null 2>&1; then
+                command -v "$tool"
+                "$tool" --version 2>&1 || true
+              else
+                printf '%s: not installed\n' "$tool"
+              fi
+            done
+          } 2>&1 | tee /tmp/w100-environment.txt
+          {
+            printf '# W100 build environment\n\n'
+            printf 'Read-only diagnostic on a standard ubuntu-24.04 runner. No source download or ROM build yet.\n\n'
+            printf '\x60\x60\x60text\n'
+            cat /tmp/w100-environment.txt
+            printf '\x60\x60\x60\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Measure preinstalled tools without removing anything
+        run: |
+          set -euo pipefail
+          {
+            printf '%s\n' 'These directory sizes are informational, not a guarantee of reclaimable space.'
+            for path in /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/share/miniconda /opt/google; do
+              if [ -d "$path" ]; then
+                sudo du -sh "$path"
+              fi
+            done
+            printf '\n--- Docker disk usage ---\n'
+            docker system df || true
+          } 2>&1 | tee /tmp/w100-preinstalled-tools.txt
+          {
+            printf '\n## Preinstalled tool sizes\n\n\x60\x60\x60text\n'
+            cat /tmp/w100-preinstalled-tools.txt
+            printf '\x60\x60\x60\n'
+          } >> "$GITHUB_STEP_SUMMARY"
