@@ -50,9 +50,11 @@ jobs:
           KBUILD_BUILD_TIMESTAMP="$(git show -s --format=%cD HEAD)"
 
           "${CROSS_COMPILE}gcc" --version
-          make dory_defconfig
+          # Invoke GCC directly because the legacy warning wrapper requires Python 2.
+          make_options=(CC="${CROSS_COMPILE}gcc")
+          make "${make_options[@]}" dory_defconfig
           # Legacy device-tree compiler relies on GCC's old common symbol behavior.
-          make -j"$(nproc)" HOSTCFLAGS="-O2 -Wall -fcommon -fgnu89-inline" zImage-dtb
+          make "${make_options[@]}" -j"$(nproc)" HOSTCFLAGS="-O2 -Wall -fcommon -fgnu89-inline" zImage-dtb
 
       - name: Verify and stage the kernel
         run: |
