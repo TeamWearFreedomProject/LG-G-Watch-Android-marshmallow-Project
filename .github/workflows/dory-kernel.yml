@@ -1,0 +1,97 @@
+name: Build W100 Marshmallow kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/dory-kernel.yml
+
+permissions: {}
+
+jobs:
+  kernel:
+    name: Compile and verify dory zImage-dtb
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      KERNEL_REF: android-msm-dory-3.10-marshmallow-mr1-wear-release
+      KERNEL_SHA: 6924014484d3406e3d2da384efc20e40e8a5ae80
+      TOOLCHAIN_REF: kitkat-wear
+      TOOLCHAIN_SHA: 8b880805d454664b3eed11d0f053cdeafa1ff06e
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libelf-dev libc6-i386 lib32stdc++6 lib32z1
+
+      - name: Fetch pinned AOSP sources
+        run: |
+          set -euo pipefail
+          git -c http.version=HTTP/1.1 clone --depth 1 --single-branch --no-tags \
+            --branch "$KERNEL_REF" \
+            https://android.googlesource.com/kernel/msm "$RUNNER_TEMP/dory-kernel"
+          git -c http.version=HTTP/1.1 clone --depth 1 --single-branch --no-tags \
+            --branch "$TOOLCHAIN_REF" \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-eabi-4.7 \
+            "$RUNNER_TEMP/dory-toolchain"
+          test "$(git -C "$RUNNER_TEMP/dory-kernel" rev-parse HEAD)" = "$KERNEL_SHA"
+          test "$(git -C "$RUNNER_TEMP/dory-toolchain" rev-parse HEAD)" = "$TOOLCHAIN_SHA"
+
+      - name: Build the ARM kernel from dory_defconfig
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dory-kernel"
+          export ARCH=arm
+          export CROSS_COMPILE="$RUNNER_TEMP/dory-toolchain/bin/arm-eabi-"
+          export KBUILD_BUILD_USER=github-actions KBUILD_BUILD_HOST=github-runner
+          export KBUILD_BUILD_TIMESTAMP
+          KBUILD_BUILD_TIMESTAMP="$(git show -s --format=%cD HEAD)"
+
+          "${CROSS_COMPILE}gcc" --version
+          make dory_defconfig
+          # Legacy device-tree compiler relies on GCC's old common symbol behavior.
+          make -j"$(nproc)" HOSTCFLAGS="-O2 -Wall -fcommon -fgnu89-inline" zImage-dtb
+
+      - name: Verify and stage the kernel
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dory-kernel"
+
+          readelf -h vmlinux | grep -E 'Machine:[[:space:]]+ARM[[:space:]]*$'
+          test -s arch/arm/boot/zImage
+          test -s arch/arm/boot/zImage-dtb
+          python3 - <<'PY'
+          from pathlib import Path
+
+          kernel = Path("arch/arm/boot/zImage").read_bytes()
+          combined = Path("arch/arm/boot/zImage-dtb").read_bytes()
+          if not combined.startswith(kernel + bytes.fromhex("d00dfeed")):
+              raise SystemExit("Expected zImage followed by an appended device tree")
+          print(f"Verified ARM zImage and appended DTB ({len(combined):,} bytes)")
+          PY
+
+          mkdir "$RUNNER_TEMP/dory-artifact"
+          cp arch/arm/boot/zImage-dtb "$RUNNER_TEMP/dory-artifact/"
+          cp .config "$RUNNER_TEMP/dory-artifact/dory.config"
+          cp System.map "$RUNNER_TEMP/dory-artifact/"
+          kernel_release="$(cat include/config/kernel.release)"
+          cd "$RUNNER_TEMP/dory-artifact"
+          sha256sum zImage-dtb dory.config System.map > SHA256SUMS
+          {
+            printf '## W100 kernel build\n\n'
+            printf -- '- Kernel release: %s\n' "$kernel_release"
+            printf -- '- Source revision: %s\n' "$KERNEL_SHA"
+            printf -- '- Toolchain revision: %s\n' "$TOOLCHAIN_SHA"
+            printf -- '- Kernel image size: %s bytes\n' "$(stat -c %s zImage-dtb)"
+            printf '\nThis artifact contains kernel build files. It is not an Android boot image or ROM.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload kernel build files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dory-marshmallow-kernel
+          path: ${{ runner.temp }}/dory-artifact/
+          if-no-files-found: error
+          retention-days: 7
