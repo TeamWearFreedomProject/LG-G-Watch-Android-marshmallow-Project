@@ -1,0 +1,80 @@
+name: Check AOSP Marshmallow build environment
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/aosp-marshmallow-check.yml
+
+permissions: {}
+
+jobs:
+  toolchain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      AOSP_TAG: android-6.0.1_r81
+      AOSP_GCC_PROJECT: prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9
+    steps:
+      - name: Build the Android 6 host environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/Dockerfile" <<'EOF'
+          FROM ubuntu:14.04
+          RUN apt-get -o Acquire::Retries=3 update \
+              && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+                   openjdk-7-jdk python make g++-multilib libc6-dev-i386 lib32z1 lib32ncurses5 \
+                   bison flex gperf zip unzip rsync bc libxml2-utils xsltproc \
+                   libgl1-mesa-dev libx11-dev lib32z1-dev lib32ncurses5-dev file \
+              && rm -rf /var/lib/apt/lists/*
+          ENV JAVA_HOME=/usr/lib/jvm/java-7-openjdk-amd64
+          EOF
+          docker build --tag aosp-marshmallow-host - < "$RUNNER_TEMP/Dockerfile"
+
+      - name: Sync the AOSP manifest and ARM build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          install -d "$RUNNER_TEMP/aosp-tools" "$RUNNER_TEMP/aosp"
+          curl -fsSL --retry 3 https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "$RUNNER_TEMP/aosp-tools/repo"
+          chmod +x "$RUNNER_TEMP/aosp-tools/repo"
+          cd "$RUNNER_TEMP/aosp"
+          repo="$RUNNER_TEMP/aosp-tools/repo"
+          "$repo" init -u https://android.googlesource.com/platform/manifest \
+            -b "refs/tags/$AOSP_TAG" --depth=1 --no-clone-bundle --no-use-superproject
+          "$repo" sync -c -j2 --no-tags --no-clone-bundle --fail-fast \
+            build "$AOSP_GCC_PROJECT"
+          git -C build rev-parse HEAD
+          git -C "$AOSP_GCC_PROJECT" rev-parse HEAD
+          df -h "$RUNNER_TEMP"
+
+      - name: Compile Java 7 and Android ARM test binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none \
+            -v "$RUNNER_TEMP/aosp:/aosp:ro" \
+            -e AOSP_GCC_PROJECT \
+            aosp-marshmallow-host bash -euo pipefail -c '
+              cd /tmp
+              java -version
+              python --version
+              printf "class Smoke { public static void main(String[] args) { System.out.println(23); } }\n" > Smoke.java
+              javac Smoke.java
+              test "$(java Smoke)" = 23
+              arm_gcc="/aosp/$AOSP_GCC_PROJECT/bin/arm-linux-androideabi-gcc"
+              "$arm_gcc" --version
+              printf "int smoke(void) { return 23; }\n" > smoke.c
+              "$arm_gcc" -march=armv7-a -ffreestanding -c smoke.c -o smoke.o
+              readelf -h smoke.o | grep -E "Class:.*ELF32"
+              readelf -h smoke.o | grep -E "Machine:.*ARM"
+            '
+          printf '%s\n' \
+            "### Android 6 toolchain check" \
+            "Synced two projects from $AOSP_TAG and compiled a Java 7 class and a 32-bit ARM object." \
+            "Full source sync and system image build are separate milestones." >> "$GITHUB_STEP_SUMMARY"
