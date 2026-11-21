@@ -1,7 +1,13 @@
-name: Check AOSP Marshmallow build environment
+name: Build AOSP Marshmallow (ARM)
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Build the generic system image or check the toolchain
+        type: choice
+        options: [systemimage, toolchain]
+        default: systemimage
   push:
     branches: [main]
     paths:
@@ -10,10 +16,11 @@ on:
 permissions: {}
 
 jobs:
-  toolchain:
+  android:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 240
     env:
+      BUILD_MODE: ${{ inputs.mode || 'systemimage' }}
       AOSP_TAG: android-6.0.1_r81
       AOSP_GCC_PROJECT: prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9
     steps:
@@ -25,7 +32,7 @@ jobs:
           FROM ubuntu:14.04
           RUN apt-get -o Acquire::Retries=3 update \
               && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-                   openjdk-7-jdk python make g++-multilib libc6-dev-i386 lib32z1 lib32ncurses5 \
+                   openjdk-7-jdk python git make g++-multilib libc6-dev-i386 lib32z1 lib32ncurses5 \
                    bison flex gperf zip unzip rsync bc libxml2-utils xsltproc \
                    libgl1-mesa-dev libx11-dev lib32z1-dev lib32ncurses5-dev file \
               && rm -rf /var/lib/apt/lists/*
@@ -33,7 +40,7 @@ jobs:
           EOF
           docker build --tag aosp-marshmallow-host - < "$RUNNER_TEMP/Dockerfile"
 
-      - name: Sync the AOSP manifest and ARM build tools
+      - name: Sync sources for the selected target
         shell: bash
         run: |
           set -euo pipefail
@@ -47,13 +54,18 @@ jobs:
           repo="$RUNNER_TEMP/aosp-tools/repo"
           "$repo" init -u https://android.googlesource.com/platform/manifest \
             -b "refs/tags/$AOSP_TAG" --depth=1 --no-clone-bundle --no-use-superproject
-          "$repo" sync -c -j2 --no-tags --no-clone-bundle --fail-fast \
-            build "$AOSP_GCC_PROJECT"
+          projects=()
+          if [[ "$BUILD_MODE" == toolchain ]]; then
+            projects=(build "$AOSP_GCC_PROJECT")
+          fi
+          "$repo" sync -c -j6 --no-tags --no-clone-bundle --fail-fast \
+            --retry-fetches=2 "${projects[@]}"
           git -C build rev-parse HEAD
           git -C "$AOSP_GCC_PROJECT" rev-parse HEAD
           df -h "$RUNNER_TEMP"
 
       - name: Compile Java 7 and Android ARM test binaries
+        if: env.BUILD_MODE == 'toolchain'
         shell: bash
         run: |
           set -euo pipefail
@@ -78,3 +90,71 @@ jobs:
             "### Android 6 toolchain check" \
             "Synced two projects from $AOSP_TAG and compiled a Java 7 class and a 32-bit ARM object." \
             "Full source sync and system image build are separate milestones." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the generic ARM Android system image
+        if: env.BUILD_MODE == 'systemimage'
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d "$RUNNER_TEMP/aosp-dist"
+          docker run --rm --network none \
+            -v "$RUNNER_TEMP/aosp:/aosp" \
+            -v "$RUNNER_TEMP/aosp-dist:/dist" \
+            -e USER=builder -e LC_ALL=C \
+            aosp-marshmallow-host bash -e -o pipefail -c '
+              cd /aosp
+              source build/envsetup.sh
+              lunch aosp_arm-eng
+              test "$(get_build_var TARGET_ARCH)" = arm
+              product_out="$(get_build_var PRODUCT_OUT)"
+              make -j4 systemimage
+              test -s "$product_out/system.img"
+              cp "$product_out/system.img" /dist/
+              cp "$product_out/system/build.prop" /dist/
+            '
+          df -h "$RUNNER_TEMP"
+
+      - name: Verify and package system.img
+        if: env.BUILD_MODE == 'systemimage'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/aosp-dist"
+          grep -Fx 'ro.build.version.sdk=23' build.prop
+          grep -Fx 'ro.product.cpu.abi=armeabi-v7a' build.prop
+          python3 - <<'PY'
+          with open("system.img", "rb") as image:
+              if image.read(4) == bytes.fromhex("3aff26ed"):
+                  print("Android sparse image")
+              else:
+                  image.seek(1080)
+                  if image.read(2) != bytes.fromhex("53ef"):
+                      raise SystemExit("Unrecognized image filesystem")
+                  print("Raw ext4 image")
+          PY
+          sha256sum system.img > SHA256SUMS
+          mkdir upload
+          tar -czf upload/aosp-6.0.1-arm-system.tar.gz system.img build.prop SHA256SUMS
+          size="$(stat -c %s upload/aosp-6.0.1-arm-system.tar.gz)"
+          if (( size > 450000000 )); then
+            echo "::error::Archive is $size bytes, above the 450 MB artifact budget for this build."
+            exit 1
+          fi
+          {
+            printf '### AOSP Marshmallow ARM\n\n'
+            printf -- '- Source: %s\n' "$AOSP_TAG"
+            printf -- '- Target: aosp_arm-eng\n'
+            printf -- '- system.img: %s bytes\n' "$(stat -c %s system.img)"
+            printf -- '- Compressed archive: %s bytes\n' "$size"
+            printf '\nThis is the generic Android baseline. W100 hardware integration is a separate step.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the generic system image
+        if: env.BUILD_MODE == 'systemimage'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: aosp-marshmallow-arm-system
+          path: ${{ runner.temp }}/aosp-dist/upload/aosp-6.0.1-arm-system.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
